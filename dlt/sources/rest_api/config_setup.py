@@ -1,3 +1,4 @@
+import re
 import warnings
 from copy import copy
 from typing import (
@@ -6,6 +7,7 @@ from typing import (
     Dict,
     Tuple,
     List,
+    Iterable,
     Optional,
     Union,
     Callable,
@@ -92,8 +94,65 @@ AUTH_MAP: Dict[str, Type[AuthConfigBase]] = {
 
 
 class IncrementalParam(NamedTuple):
-    start: str
+    start: Optional[str]
     end: Optional[str]
+
+
+class AttributeAccessibleDict(Dict[str, Any]):
+    def __getattr__(self, key: str) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key)
+
+
+class ResourcesContext:
+    def __init__(self) -> None:
+        self._resources: Dict[str, AttributeAccessibleDict] = {}
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._resources:
+            self._resources[key] = AttributeAccessibleDict()
+        return self._resources[key]
+
+    def __getattr__(self, key: str) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key)
+
+
+# TODO: Remove once Incremental can do values conversion internally
+class InterceptingProxy:
+    """A proxy class that intercepts access to selected attributes and
+    calls a function with the attribute value before returning it.
+    Attributes that are not in the intercept set are returned as is.
+    """
+
+    def __init__(
+        self,
+        instance: Any,
+        intercept_function: Callable[..., Any],
+        intercept_attributes: Optional[Iterable[str]] = None,
+    ) -> None:
+        self._instance = instance
+        self._intercept_function = intercept_function
+        self._intercept_attributes = set(intercept_attributes) if intercept_attributes else set()
+
+    def __getattribute__(self, name: str) -> Any:
+        if name.startswith("_"):
+            return super().__getattribute__(name)
+
+        intercept_attributes = super().__getattribute__("_intercept_attributes")
+        instance = super().__getattribute__("_instance")
+
+        if name in intercept_attributes:
+            attribute_value = getattr(instance, name)
+            intercept_function = super().__getattribute__("_intercept_function")
+
+            return intercept_function(attribute_value)
+        else:
+            return getattr(instance, name)
 
 
 def register_paginator(
@@ -217,7 +276,7 @@ def setup_incremental_object(
                     f"Only initial_value is allowed in the configuration of param: {param_name}. To"
                     " set end_value too use the incremental configuration at the resource level."
                     " See"
-                    " https://dlthub.com/docs/dlt-ecosystem/verified-sources/rest_api#incremental-loading/"
+                    " https://dlthub.com/docs/dlt-ecosystem/verified-sources/rest_api/basic#incremental-loading"
                 )
             return param_config, IncrementalParam(start=param_name, end=None), None
         if isinstance(param_config, dict) and param_config.get("type") == "incremental":
@@ -226,7 +285,7 @@ def setup_incremental_object(
                     "Only start_param and initial_value are allowed in the configuration of param:"
                     f" {param_name}. To set end_value too use the incremental configuration at the"
                     " resource level. See"
-                    " https://dlthub.com/docs/dlt-ecosystem/verified-sources/rest_api#incremental-loading"
+                    " https://dlthub.com/docs/dlt-ecosystem/verified-sources/rest_api/basic#incremental-loading"
                 )
             convert = parse_convert_or_deprecated_transform(param_config)
 
@@ -245,7 +304,7 @@ def setup_incremental_object(
         return (
             Incremental(**config),
             IncrementalParam(
-                start=incremental_config["start_param"],
+                start=incremental_config.get("start_param"),
                 end=incremental_config.get("end_param"),
             ),
             convert,
@@ -285,7 +344,6 @@ def build_resource_dependency_graph(
     dependency_graph: graphlib.TopologicalSorter = graphlib.TopologicalSorter()  # type: ignore[type-arg]
     resolved_param_map: Dict[str, Optional[List[ResolvedParam]]] = {}
     endpoint_resource_map = expand_and_index_resources(resource_list, resource_defaults)
-
     # create dependency graph
     for resource_name, endpoint_resource in endpoint_resource_map.items():
         if isinstance(endpoint_resource, DltResource):
@@ -295,6 +353,20 @@ def build_resource_dependency_graph(
         assert isinstance(endpoint_resource["endpoint"], dict)
         # find resolved parameters to connect dependent resources
         resolved_params = _find_resolved_params(endpoint_resource["endpoint"])
+
+        # extract more resolved params from path expressions
+        path_expressions = _extract_expressions(endpoint_resource["endpoint"]["path"], "resources.")
+        resolved_params += _expressions_to_resolved_params(path_expressions)
+
+        # extract expressions from parameters that are strings
+        params_expressions = []
+        for param_value in endpoint_resource["endpoint"].get("params", {}).values():
+            # If param_value is a plain string (e.g. "{resources.berry.a_property}")
+            if isinstance(param_value, str):
+                extracted = _extract_expressions(param_value, "resources.")
+                params_expressions.extend(extracted)
+
+        resolved_params += _expressions_to_resolved_params(params_expressions)
 
         # set of resources in resolved params
         named_resources = {rp.resolve_config["resource"] for rp in resolved_params}
@@ -307,7 +379,7 @@ def build_resource_dependency_graph(
             predecessor = first_param.resolve_config["resource"]
             if predecessor not in endpoint_resource_map:
                 raise ValueError(
-                    f"A transformer resource {resource_name} refers to non existing parent resource"
+                    f"A dependent resource {resource_name} refers to non existing parent resource"
                     f" {predecessor} on {first_param}"
                 )
 
@@ -383,15 +455,46 @@ def _make_endpoint_resource(
     return _merge_resource_endpoints(default_config, resource)
 
 
+def _encode_template_placeholders(
+    text: str, prefix: str, delimiter_char: str = "||"
+) -> Tuple[str, Dict[str, str]]:
+    """Encodes substrings starting with prefix in text using delimiter_char."""
+
+    # Store original values for restoration
+    replacements = {}
+
+    def replace_match(match: re.Match[str]) -> Any:
+        content = match.group(1)
+        if content.startswith(prefix):
+            # Generate a unique key for this replacement
+            key = f"{delimiter_char}{content}{delimiter_char}"
+            replacements[key] = match.group(0)
+            return key
+        # Return unchanged for further processing
+        return match.group(0)
+
+    # Find all {...} patterns and selectively replace them
+    pattern = r"\{\s*([^}]+)\}"
+    transformed = re.sub(pattern, replace_match, text)
+    return transformed, replacements
+
+
+def _decode_special_objects(text: str, replacements: Dict[str, str]) -> str:
+    for key, value in replacements.items():
+        text = text.replace(key, value)
+    return text
+
+
 def _bind_path_params(resource: EndpointResource) -> None:
     """Binds params declared in path to params available in `params`. Pops the
-    bound params but. Params of type `resolve` and `incremental` are skipped
+    bound params. Params of type `resolve` and `incremental` are skipped
     and bound later.
     """
     path_params: Dict[str, Any] = {}
     assert isinstance(resource["endpoint"], dict)  # type guard
-    resolve_params = [r.param_name for r in _find_resolved_params(resource["endpoint"])]
-    path = resource["endpoint"]["path"]
+    resolved_params = [r.param_name for r in _find_resolved_params(resource["endpoint"])]
+    path, replacements = _encode_template_placeholders(resource["endpoint"]["path"], "resources.")
+
     for format_ in string.Formatter().parse(path):
         name = format_[1]
         if name:
@@ -401,8 +504,8 @@ def _bind_path_params(resource: EndpointResource) -> None:
                     f"The path {path} defined in resource {resource['name']} requires param with"
                     f" name {name} but it is not found in {params}"
                 )
-            if name in resolve_params:
-                resolve_params.remove(name)
+            if name in resolved_params:
+                resolved_params.remove(name)
             if name in params:
                 if not isinstance(params[name], dict):
                     # bind resolved param and pop it from endpoint
@@ -418,13 +521,13 @@ def _bind_path_params(resource: EndpointResource) -> None:
                     # resolved params are bound later
                     path_params[name] = "{" + name + "}"
 
-    if len(resolve_params) > 0:
+    if len(resolved_params) > 0:
         raise NotImplementedError(
-            f"Resource {resource['name']} defines resolve params {resolve_params} that are not"
+            f"Resource {resource['name']} defines resolve params {resolved_params} that are not"
             f" bound in path {path}. Resolve query params not supported yet."
         )
 
-    resource["endpoint"]["path"] = path.format(**path_params)
+    resource["endpoint"]["path"] = _decode_special_objects(path.format(**path_params), replacements)
 
 
 def _setup_single_entity_endpoint(endpoint: Endpoint) -> Endpoint:
@@ -455,6 +558,49 @@ def _find_resolved_params(endpoint_config: Endpoint) -> List[ResolvedParam]:
         for key, value in endpoint_config.get("params", {}).items()
         if (isinstance(value, dict) and value.get("type") == "resolve")
     ]
+
+
+def _extract_expressions(template_string: str, prefix: str) -> List[str]:
+    """Takes a tepmlate string and extracts expressions that start with a prefix.
+
+    Args:
+        template_string (str): A string with expressions to extract
+        prefix (str): A string that marks the beginning of an expression
+
+    Example:
+        >>> _extract_expressions("blog/{resources.blog.id}/comments", "resources.")
+        ["resources.blog.id"]
+    """
+    expressions = []
+    for field_parts in string.Formatter().parse(template_string):
+        field_name = (field_parts[1] or "").strip()
+        if field_name and field_name.startswith(prefix):
+            expressions.append(field_name)
+    return expressions
+
+
+def _expressions_to_resolved_params(expressions: List[str]) -> List[ResolvedParam]:
+    resolved_params = []
+    # We assume that the expressions are in the format 'resources.<resource>.<field>'
+    # and not more complex expressions
+    for expression in expressions:
+        parts = expression.strip().split(".")
+        if len(parts) != 3:
+            raise ValueError(
+                f"Invalid definition of {expression}. Expected format:"
+                " 'resources.<resource>.<field>'"
+            )
+        resolved_params.append(
+            ResolvedParam(
+                expression,
+                {
+                    "type": "resolve",
+                    "resource": parts[1],
+                    "field": parts[2],
+                },
+            )
+        )
+    return resolved_params
 
 
 def _action_type_unless_custom_hook(
@@ -580,28 +726,62 @@ def create_response_hooks(
 def process_parent_data_item(
     path: str,
     item: Dict[str, Any],
+    params: Dict[str, Any],
     resolved_params: List[ResolvedParam],
-    include_from_parent: List[str],
-) -> Tuple[str, Dict[str, Any]]:
+    include_from_parent: Optional[List[str]],
+    incremental: Optional[Incremental[Any]] = None,
+    incremental_value_convert: Optional[Callable[..., Any]] = None,
+) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
     parent_resource_name = resolved_params[0].resolve_config["resource"]
 
-    param_values = {}
+    resources_context = ResourcesContext()
 
+    param_values: Dict[str, Any] = {}
+
+    # Collect plain resolved params
     for resolved_param in resolved_params:
         field_values = jsonpath.find_values(resolved_param.field_path, item)
 
         if not field_values:
             field_path = resolved_param.resolve_config["field"]
             raise ValueError(
-                f"Transformer expects a field '{field_path}' to be present in the incoming data"
+                f"Resource expects a field '{field_path}' to be present in the incoming data"
                 f" from resource {parent_resource_name} in order to bind it to path param"
                 f" {resolved_param.param_name}. Available parent fields are"
                 f" {', '.join(item.keys())}"
             )
 
-        param_values[resolved_param.param_name] = field_values[0]
+        # If resolved param was defined as `resources.<resource>.<field>`, then
+        # add it to the resources context
+        param_name = resolved_param.param_name
+        if param_name.startswith("resources."):
+            resource_name, field_name = param_name.split(".")[1:]
+            resources_context[resource_name][field_name] = field_values[0]
+            param_values["resources"] = resources_context
+        else:
+            param_values[resolved_param.param_name] = field_values[0]
+
+    if incremental:
+        _incremental: Union[Incremental[Any], InterceptingProxy]
+        if incremental_value_convert:
+            _incremental = InterceptingProxy(
+                incremental,
+                incremental_value_convert,
+                {"last_value", "end_value"},
+            )
+        else:
+            _incremental = incremental
+        param_values["incremental"] = _incremental
 
     bound_path = path.format(**param_values)
+
+    # Expand params with resolved values
+    expanded_params = {}
+    for key, value in params.items():
+        if isinstance(value, str):
+            expanded_params[key] = value.format(**param_values)
+        else:
+            expanded_params[key] = value
 
     parent_record: Dict[str, Any] = {}
     if include_from_parent:
@@ -609,13 +789,13 @@ def process_parent_data_item(
             child_key = make_parent_key_name(parent_resource_name, parent_key)
             if parent_key not in item:
                 raise ValueError(
-                    f"Transformer expects a field '{parent_key}' to be present in the incoming data"
+                    f"Resource expects a field '{parent_key}' to be present in the incoming data"
                     f" from resource {parent_resource_name} in order to include it in child records"
                     f" under {child_key}. Available parent fields are {', '.join(item.keys())}"
                 )
             parent_record[child_key] = item[parent_key]
 
-    return bound_path, parent_record
+    return bound_path, expanded_params, parent_record
 
 
 def _merge_resource_endpoints(
